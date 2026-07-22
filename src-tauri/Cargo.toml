@@ -1,6 +1,6 @@
 [package]
 name = "papersignal"
-version = "0.1.1"
+version = "0.1.2"
 description = "Local-first content studio for WeChat and Xiaohongshu"
 authors = ["PaperSignal"]
 edition = "2021"
