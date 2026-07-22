@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+src-tauri/target/
+src-tauri/gen/
+.DS_Store
+*.dmg
+*.exe
+*.msi
+*.app
+.playwright-cli/
+output/
+*.png

@@ -1,0 +1,47 @@
+name: Release desktop app
+
+on:
+  push:
+    tags:
+      - 'app-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --bundles dmg
+          - platform: windows-latest
+            args: --bundles nsis
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build and upload installers
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: PaperSignal v__VERSION__
+          releaseBody: |
+            本地优先的公众号与小红书内容工作台。
+            - macOS：下载 `.dmg`
+            - Windows：下载 `.exe`
+            - API Key 仅保存于本机系统钥匙串
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

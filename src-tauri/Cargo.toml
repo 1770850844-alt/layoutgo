@@ -1,0 +1,22 @@
+[package]
+name = "papersignal"
+version = "0.1.0"
+description = "Local-first content studio for WeChat and Xiaohongshu"
+authors = ["PaperSignal"]
+edition = "2021"
+
+[lib]
+name = "papersignal_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.1", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.0", features = [] }
+tauri-plugin-sql = { version = "2.3.0", features = ["sqlite"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+keyring = "3.6.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
