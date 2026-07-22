@@ -18,6 +18,11 @@ export async function hasApiKey(serviceId: string): Promise<boolean> {
   return invokeDesktop<boolean>('has_api_key', { serviceId });
 }
 
+export async function migrateApiKeys(serviceIds: string[]): Promise<number> {
+  if (!isDesktop() || serviceIds.length === 0) return 0;
+  return invokeDesktop<number>('migrate_api_keys', { serviceIds });
+}
+
 export async function testAiConnection(service: AiService, apiKey?: string): Promise<string> {
   if (!isDesktop()) throw new Error('AI 服务测试仅支持在桌面版中运行。');
   return invokeDesktop<string>('test_ai_connection', { serviceId: service.id, baseUrl: service.baseUrl, model: service.model, apiKey: apiKey?.trim() || null });

@@ -5,33 +5,71 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-const SERVICE: &str = "com.papersignal.desktop";
+const SERVICE: &str = "com.layoutgo.desktop";
+const LEGACY_SERVICE: &str = "com.papersignal.desktop";
 
 fn entry(service_id: &str) -> Result<Entry, String> {
   Entry::new(SERVICE, service_id).map_err(|error| error.to_string())
 }
 
+fn legacy_entry(service_id: &str) -> Result<Entry, String> {
+  Entry::new(LEGACY_SERVICE, service_id).map_err(|error| error.to_string())
+}
+
+fn migrate_legacy_api_key(service_id: &str) -> Result<bool, String> {
+  let current = entry(service_id)?;
+  if current.get_password().is_ok() {
+    return Ok(false);
+  }
+
+  let legacy = legacy_entry(service_id)?;
+  let Ok(api_key) = legacy.get_password() else {
+    return Ok(false);
+  };
+
+  current.set_password(&api_key).map_err(|error| error.to_string())?;
+  let _ = legacy.delete_credential();
+  Ok(true)
+}
+
+fn api_key_for_service(service_id: &str) -> Result<String, String> {
+  let _ = migrate_legacy_api_key(service_id)?;
+  entry(service_id)?
+    .get_password()
+    .map_err(|_| "未找到此服务的 API Key，请先保存 Key。".to_string())
+}
+
 #[tauri::command]
 fn save_api_key(service_id: String, api_key: String) -> Result<(), String> {
   if service_id.trim().is_empty() || api_key.trim().is_empty() { return Err("服务和 API Key 不能为空".into()); }
-  entry(&service_id)?.set_password(&api_key).map_err(|error| error.to_string())
+  entry(&service_id)?.set_password(&api_key).map_err(|error| error.to_string())?;
+  let _ = legacy_entry(&service_id).and_then(|item| item.delete_credential().map_err(|error| error.to_string()));
+  Ok(())
 }
 
 #[tauri::command]
 fn has_api_key(service_id: String) -> bool {
-  entry(&service_id).and_then(|item| item.get_password().map_err(|error| error.to_string())).is_ok()
+  migrate_legacy_api_key(&service_id).is_ok()
+    && entry(&service_id).and_then(|item| item.get_password().map_err(|error| error.to_string())).is_ok()
 }
 
 #[tauri::command]
 fn delete_api_key(service_id: String) -> Result<(), String> {
-  entry(&service_id)?.delete_credential().map_err(|error| error.to_string())
+  let _ = entry(&service_id).and_then(|item| item.delete_credential().map_err(|error| error.to_string()));
+  let _ = legacy_entry(&service_id).and_then(|item| item.delete_credential().map_err(|error| error.to_string()));
+  Ok(())
+}
+
+#[tauri::command]
+fn migrate_api_keys(service_ids: Vec<String>) -> usize {
+  service_ids.into_iter().filter(|service_id| !service_id.trim().is_empty()).filter(|service_id| migrate_legacy_api_key(service_id).unwrap_or(false)).count()
 }
 
 async fn request_chat(service_id: &str, base_url: &str, model: &str, prompt: &str, supplied_key: Option<String>) -> Result<String, String> {
   if base_url.trim().is_empty() || model.trim().is_empty() { return Err("请填写 Base URL 和模型名。".into()); }
   let api_key = match supplied_key.filter(|key| !key.trim().is_empty()) {
     Some(key) => key,
-    None => entry(service_id)?.get_password().map_err(|_| "未找到此服务的 API Key，请先保存 Key。".to_string())?
+    None => api_key_for_service(service_id)?
   };
   let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
   let body = json!({
@@ -158,7 +196,7 @@ async fn inspect_wechat_articles(urls: Vec<String>) -> Result<Vec<ArticleReferen
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_sql::Builder::default().build())
-    .invoke_handler(tauri::generate_handler![save_api_key, has_api_key, delete_api_key, test_ai_connection, generate_content, inspect_wechat_articles])
+    .invoke_handler(tauri::generate_handler![save_api_key, has_api_key, delete_api_key, migrate_api_keys, test_ai_connection, generate_content, inspect_wechat_articles])
     .run(tauri::generate_context!())
     .expect("error while running LayoutGo");
 }

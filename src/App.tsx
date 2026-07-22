@@ -4,7 +4,7 @@ import { Check, CheckCircle2, CircleAlert, CircleDashed, Clipboard, Download, Fi
 import { RichEditor } from './components/RichEditor';
 import { PhonePreview } from './components/PhonePreview';
 import { inspectWechatArticles } from './lib/articleReference';
-import { deleteApiKey, generateWithAi, hasApiKey, saveApiKey, testAiConnection } from './lib/ai';
+import { deleteApiKey, generateWithAi, hasApiKey, migrateApiKeys, saveApiKey, testAiConnection } from './lib/ai';
 import { cardSvg, makeCards } from './lib/card';
 import { getProvider, providers } from './lib/providers';
 import { deleteDraft, deleteXhsDraft, loadAiServices, loadBrand, loadCustomTemplates, loadDrafts, loadXhsDrafts, saveAiServices, saveBrand, saveCustomTemplates, saveDraft, saveXhsDraft } from './lib/storage';
@@ -305,6 +305,9 @@ export default function App() {
       setAiServices(savedAi.services); setActiveAiServiceId(savedAi.activeServiceId);
       const active = savedAi.services.find((service) => service.id === savedAi.activeServiceId) ?? savedAi.services[0];
       if (active) setAiConfig(active);
+      migrateApiKeys(savedAi.services.map((service) => service.id)).then((count) => {
+        if (count) notify(`已迁移 ${count} 个 AI 服务的本机 Key`);
+      }).catch(() => undefined);
     }).catch(() => notify('本地数据库初始化失败，已切换临时存储。'));
   }, []);
   useEffect(() => { if (view !== 'aiSettings') return; hasApiKey(aiConfig.id).then(setHasKey).catch(() => setHasKey(false)); }, [view, aiConfig.id]);
