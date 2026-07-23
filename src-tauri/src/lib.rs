@@ -65,26 +65,61 @@ fn migrate_api_keys(service_ids: Vec<String>) -> usize {
   service_ids.into_iter().filter(|service_id| !service_id.trim().is_empty()).filter(|service_id| migrate_legacy_api_key(service_id).unwrap_or(false)).count()
 }
 
+fn chat_endpoint(base_url: &str) -> Result<String, String> {
+  let normalized = base_url.trim().trim_end_matches('/');
+  let parsed = reqwest::Url::parse(normalized).map_err(|_| "Base URL 必须是有效的 http 或 https 地址。".to_string())?;
+  if !matches!(parsed.scheme(), "http" | "https") { return Err("Base URL 仅支持 http 或 https 地址。".into()); }
+  Ok(if normalized.ends_with("/chat/completions") { normalized.to_string() } else { format!("{normalized}/chat/completions") })
+}
+
+fn response_error(payload: &Value, fallback: &str) -> String {
+  payload.pointer("/error/message")
+    .or_else(|| payload.get("message"))
+    .or_else(|| payload.pointer("/error/msg"))
+    .and_then(Value::as_str)
+    .filter(|message| !message.trim().is_empty())
+    .map(str::to_owned)
+    .unwrap_or_else(|| fallback.chars().take(600).collect())
+}
+
+fn response_content(payload: &Value) -> Option<String> {
+  let content = payload.pointer("/choices/0/message/content")?;
+  if let Some(text) = content.as_str() { return Some(text.to_string()); }
+  content.as_array()?.iter().filter_map(|item| {
+    item.get("text").or_else(|| item.get("content")).and_then(Value::as_str)
+  }).collect::<String>().trim().to_string().into()
+}
+
 async fn request_chat(service_id: &str, base_url: &str, model: &str, prompt: &str, supplied_key: Option<String>) -> Result<String, String> {
   if base_url.trim().is_empty() || model.trim().is_empty() { return Err("请填写 Base URL 和模型名。".into()); }
   let api_key = match supplied_key.filter(|key| !key.trim().is_empty()) {
     Some(key) => key,
     None => api_key_for_service(service_id)?
   };
-  let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+  let url = chat_endpoint(base_url)?;
   let body = json!({
     "model": model.trim(),
-    "temperature": 0.2,
     "messages": [
       { "role": "system", "content": "你是中文内容编辑助手。严格遵守用户要求，输出可直接使用的中文内容。" },
       { "role": "user", "content": prompt }
     ]
   });
-  let response = reqwest::Client::new().post(url).bearer_auth(api_key).json(&body).send().await.map_err(|error| format!("请求失败：{error}"))?;
+  let client = reqwest::Client::builder()
+    .connect_timeout(Duration::from_secs(15))
+    .timeout(Duration::from_secs(90))
+    .build()
+    .map_err(|error| format!("初始化网络连接失败：{error}"))?;
+  let response = client.post(url).bearer_auth(api_key).json(&body).send().await.map_err(|error| format!("请求失败：{error}"))?;
   let status = response.status();
-  let payload: Value = response.json().await.map_err(|error| format!("响应解析失败：{error}"))?;
-  if !status.is_success() { return Err(payload.get("error").and_then(|value| value.get("message")).and_then(Value::as_str).unwrap_or("服务商返回错误").to_string()); }
-  payload.get("choices").and_then(|value| value.get(0)).and_then(|value| value.get("message")).and_then(|value| value.get("content")).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| "服务商未返回可用内容".to_string())
+  let response_text = response.text().await.map_err(|error| format!("读取服务商响应失败：{error}"))?;
+  let payload: Value = serde_json::from_str(&response_text).unwrap_or(Value::Null);
+  if !status.is_success() {
+    return Err(format!("HTTP {status}：{}", response_error(&payload, &response_text)));
+  }
+  response_content(&payload).filter(|content| !content.trim().is_empty()).ok_or_else(|| {
+    let detail = response_error(&payload, &response_text);
+    if detail.is_empty() { "服务商未返回可用内容。".to_string() } else { format!("服务商未返回可用内容：{detail}") }
+  })
 }
 
 #[tauri::command]

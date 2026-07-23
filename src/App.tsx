@@ -3,15 +3,17 @@ import JSZip from 'jszip';
 import { Check, CheckCircle2, CircleAlert, CircleDashed, Clipboard, Download, FileCode2, FilePlus2, FileText, FolderClock, KeyRound, LoaderCircle, Palette, PanelsTopLeft, Plus, PlugZap, Save, Search, ServerCog, Sparkles, Trash2, Wand2, X } from 'lucide-react';
 import { RichEditor } from './components/RichEditor';
 import { PhonePreview } from './components/PhonePreview';
+import { GlitterBackdrop } from './components/GlitterBackdrop';
 import { inspectWechatArticles } from './lib/articleReference';
 import { deleteApiKey, generateWithAi, hasApiKey, migrateApiKeys, saveApiKey, testAiConnection } from './lib/ai';
 import { cardSvg, makeCards } from './lib/card';
-import { getProvider, providers } from './lib/providers';
+import { getProvider, providers, refreshProviderDefaults } from './lib/providers';
 import { deleteDraft, deleteXhsDraft, loadAiServices, loadBrand, loadCustomTemplates, loadDrafts, loadXhsDrafts, saveAiServices, saveBrand, saveCustomTemplates, saveDraft, saveXhsDraft } from './lib/storage';
 import { getWechatTemplate, wechatTemplates, xhsTemplates } from './lib/templates';
 import type { AiService, ArticleReference, Brand, Card, CustomTemplate, Draft, Platform, PreviewMode, TemplateId, XhsDraft, XhsTemplateId } from './lib/types';
 import './styles.css';
 
+const layoutGoLogoUrl = `${import.meta.env.BASE_URL}layoutgo-logo-transparent.png`;
 type View = 'wechat' | 'cards' | 'convert' | 'aiSettings' | 'drafts';
 
 const initialTemplate = getWechatTemplate('w-journal');
@@ -19,6 +21,15 @@ const blankDocument = '<p><br /></p>';
 const newDraft = (): Draft => ({ id: crypto.randomUUID(), title: '未命名文档', template: initialTemplate.id, content: blankDocument, updatedAt: new Date().toISOString() });
 const getText = (html: string) => new DOMParser().parseFromString(html, 'text/html').body.textContent?.trim() ?? '';
 const isBlankDocument = (html: string) => !getText(html) && !/<(?:img|table|figure)\b/i.test(html);
+const errorMessage = (error: unknown, fallback: string) => {
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === 'string' && error.trim()) return error;
+  if (error && typeof error === 'object') {
+    const message = 'message' in error ? error.message : 'error' in error ? error.error : null;
+    if (typeof message === 'string' && message.trim()) return message;
+  }
+  return fallback;
+};
 const toEditorHtml = (text: string) => text.trim().split(/\n{2,}/).filter(Boolean).map((paragraph) => `<p>${paragraph.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>`).join('') || blankDocument;
 const newAiService = (providerId = 'openai'): AiService => {
   const provider = getProvider(providerId);
@@ -289,6 +300,8 @@ export default function App() {
   const [isTestingAi, setIsTestingAi] = useState(false);
   const [isSavingAi, setIsSavingAi] = useState(false);
   const saveTimer = useRef<number>();
+  const deletedDraftIds = useRef(new Set<string>());
+  const pendingDraftSaves = useRef(new Map<string, Promise<void>>());
 
   const wordCount = useMemo(() => getText(view === 'cards' ? xhsContent : draft.content).length, [draft.content, view, xhsContent]);
   const availableTemplates = useMemo(() => [...wechatTemplates, ...customTemplates.map((template, index) => ({ ...template, index: `C${index + 1}` }))], [customTemplates]);
@@ -298,14 +311,21 @@ export default function App() {
 
   useEffect(() => {
     Promise.all([loadDrafts(), loadXhsDrafts(), loadBrand(), loadAiServices(), loadCustomTemplates()]).then(([savedDrafts, savedXhsDrafts, savedBrand, savedAi, savedTemplates]) => {
+      const refreshedServices = refreshProviderDefaults(savedAi.services);
+      const defaultsUpdated = refreshedServices.some((service, index) => service !== savedAi.services[index]);
       setDrafts(savedDrafts); setBrand(savedBrand);
       setXhsDrafts(savedXhsDrafts);
       setCustomTemplates(savedTemplates);
       if (savedDrafts[0]) setDraft(savedDrafts[0]);
-      setAiServices(savedAi.services); setActiveAiServiceId(savedAi.activeServiceId);
-      const active = savedAi.services.find((service) => service.id === savedAi.activeServiceId) ?? savedAi.services[0];
+      setAiServices(refreshedServices); setActiveAiServiceId(savedAi.activeServiceId);
+      const active = refreshedServices.find((service) => service.id === savedAi.activeServiceId) ?? refreshedServices[0];
       if (active) setAiConfig(active);
-      migrateApiKeys(savedAi.services.map((service) => service.id)).then((count) => {
+      if (defaultsUpdated) {
+        void saveAiServices({ services: refreshedServices, activeServiceId: savedAi.activeServiceId }).then(() => {
+          notify('已更新 DeepSeek 默认模型，请重新测试该服务');
+        }).catch(() => notify('DeepSeek 默认模型更新未能保存，请手动重新配置'));
+      }
+      migrateApiKeys(refreshedServices.map((service) => service.id)).then((count) => {
         if (count) notify(`已迁移 ${count} 个 AI 服务的本机 Key`);
       }).catch(() => undefined);
     }).catch(() => notify('本地数据库初始化失败，已切换临时存储。'));
@@ -314,8 +334,18 @@ export default function App() {
   useEffect(() => {
     window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {
+      if (deletedDraftIds.current.has(draft.id)) return;
       const next = { ...draft, updatedAt: new Date().toISOString() };
-      saveDraft(next).then(() => setDrafts((items) => [next, ...items.filter((item) => item.id !== next.id)]));
+      const task = saveDraft(next);
+      pendingDraftSaves.current.set(next.id, task);
+      void task.then(() => {
+        if (deletedDraftIds.current.has(next.id)) return;
+        setDrafts((items) => [next, ...items.filter((item) => item.id !== next.id)]);
+      }).catch(() => {
+        if (!deletedDraftIds.current.has(next.id)) notify('本地草稿自动保存失败');
+      }).finally(() => {
+        if (pendingDraftSaves.current.get(next.id) === task) pendingDraftSaves.current.delete(next.id);
+      });
     }, 650);
     return () => window.clearTimeout(saveTimer.current);
   }, [draft.id, draft.title, draft.template, draft.content]);
@@ -407,12 +437,18 @@ export default function App() {
   const saveCurrentDraft = async () => {
     window.clearTimeout(saveTimer.current);
     const next = { ...draft, updatedAt: new Date().toISOString() };
+    const task = saveDraft(next);
+    pendingDraftSaves.current.set(next.id, task);
     try {
-      await saveDraft(next);
+      await task;
+      if (deletedDraftIds.current.has(next.id)) return;
       setDraft(next);
       setDrafts((items) => [next, ...items.filter((item) => item.id !== next.id)]);
       notify('已保存到本地草稿');
-    } catch (error) { notify(error instanceof Error ? error.message : '本地草稿保存失败'); }
+    } catch (error) { notify(error instanceof Error ? error.message : '本地草稿保存失败');
+    } finally {
+      if (pendingDraftSaves.current.get(next.id) === task) pendingDraftSaves.current.delete(next.id);
+    }
   };
   const saveCurrentXhsDraft = async () => {
     const next: XhsDraft = { id: xhsDraftId, title: xhsTitle, template: xhsTemplate, content: xhsContent, cards, caption, updatedAt: new Date().toISOString() };
@@ -435,13 +471,19 @@ export default function App() {
   };
   const removeDraft = async (item: Draft) => {
     if (!window.confirm(`删除草稿“${item.title}”？此操作无法恢复。`)) return;
+    window.clearTimeout(saveTimer.current);
+    deletedDraftIds.current.add(item.id);
     try {
+      await pendingDraftSaves.current.get(item.id)?.catch(() => undefined);
       await deleteDraft(item.id);
       const remaining = drafts.filter((draftItem) => draftItem.id !== item.id);
       setDrafts(remaining);
       if (draft.id === item.id) { const next = remaining[0] ?? newDraft(); setDraft(next); }
       notify('草稿已删除');
-    } catch (error) { notify(error instanceof Error ? error.message : '删除草稿失败'); }
+    } catch (error) {
+      deletedDraftIds.current.delete(item.id);
+      notify(error instanceof Error ? error.message : '删除草稿失败');
+    }
   };
   const removeXhsDraft = async (item: XhsDraft) => {
     if (!window.confirm(`删除小红书制卡草稿“${item.title}”？此操作无法恢复。`)) return;
@@ -501,7 +543,7 @@ export default function App() {
       setReferenceOpen(false);
       notify('已按参考文章的结构与视觉节奏改写当前文章');
     } catch (error) {
-      notify(error instanceof Error ? `风格改写失败：${error.message}` : '风格改写失败');
+      notify(`风格改写失败：${errorMessage(error, '请检查 AI 服务配置')}`);
     } finally { setIsRestylingFromReference(false); }
   };
   const generateCards = async () => {
@@ -517,7 +559,7 @@ export default function App() {
       setXhsContent(content);
       setXhsTitle(getText(content).split(/[。！？\n]/)[0]?.slice(0, 30) || '未命名卡片');
       setCaption(parsed.caption ?? ''); openView('cards'); notify('已生成小红书图文初稿');
-    } catch (error) { notify(error instanceof Error ? `AI 生成失败：${error.message}` : 'AI 生成失败'); } finally { setIsGenerating(false); }
+    } catch (error) { notify(`AI 生成失败：${errorMessage(error, '请检查 AI 服务配置')}`); } finally { setIsGenerating(false); }
   };
   const aiTypesetArticle = async () => {
     if (isBlankDocument(draft.content)) { notify('请先粘贴或输入需要排版的文章'); return; }
@@ -532,7 +574,7 @@ export default function App() {
       const title = getText(content).split(/[。！？\n]/)[0]?.slice(0, 30) || draft.title;
       setDraft((current) => ({ ...current, title, content }));
       notify('AI 已完成公众号排版');
-    } catch (error) { notify(error instanceof Error ? `AI 排版失败：${error.message}` : 'AI 排版失败'); } finally { setIsGenerating(false); }
+    } catch (error) { notify(`AI 排版失败：${errorMessage(error, '请检查 AI 服务配置')}`); } finally { setIsGenerating(false); }
   };
   const aiCreateCards = async () => {
     const source = getText(xhsContent);
@@ -545,7 +587,7 @@ export default function App() {
       setCards(parsed.cards.slice(0, 6).map((card, index) => ({ id: crypto.randomUUID(), index: index + 1, title: card.title, body: card.body, theme: (['cover', 'quote', 'list', 'memo'] as const)[index % 4] })));
       setCaption(parsed.caption ?? '');
       notify('AI 已生成小红书图文');
-    } catch (error) { notify(error instanceof Error ? `AI 制卡失败：${error.message}` : 'AI 制卡失败'); } finally { setIsGenerating(false); }
+    } catch (error) { notify(`AI 制卡失败：${errorMessage(error, '请检查 AI 服务配置')}`); } finally { setIsGenerating(false); }
   };
   const expandArticle = async () => {
     if (!requireAi()) return;
@@ -554,15 +596,16 @@ export default function App() {
       const source = noteSource.trim() || caption || getText(xhsContent);
       const output = await generateWithAi(activeAiService!, `${wechatPrompt}\n\n输入小红书笔记：\n${source}`);
       changeContent(unwrapAiOutput(output)); openView('wechat'); notify('已生成公众号文章初稿');
-    } catch (error) { notify(error instanceof Error ? `AI 扩写失败：${error.message}` : 'AI 扩写失败'); } finally { setIsGenerating(false); }
+    } catch (error) { notify(`AI 扩写失败：${errorMessage(error, '请检查 AI 服务配置')}`); } finally { setIsGenerating(false); }
   };
   const selectProvider = (providerId: string) => { const provider = getProvider(providerId); setAiConfig((current) => ({ ...current, providerId, baseUrl: provider.baseUrl, model: provider.model, name: current.name === getProvider(current.providerId).name ? provider.name : current.name, lastTestStatus: 'untested', lastTestedAt: undefined, lastTestMessage: undefined })); };
   const activateAiService = async (service: AiService) => { setAiConfig(service); setActiveAiServiceId(service.id); setApiKey(''); await saveAiServices({ services: aiServices, activeServiceId: service.id }); };
   const testCurrentService = async () => {
     if (!aiConfig.name.trim() || !aiConfig.baseUrl.trim() || !aiConfig.model.trim()) { notify('请填写服务名称、Base URL 和模型名'); return null; }
+    if (!apiKey.trim() && !hasKey) { notify('请先填写 API Key，再测试连接'); return null; }
     setIsTestingAi(true);
     try { const message = await testAiConnection(aiConfig, apiKey); const tested = { ...aiConfig, lastTestStatus: 'success' as const, lastTestMessage: message, lastTestedAt: new Date().toISOString() }; setAiConfig(tested); notify('AI 服务通路测试成功'); return tested; }
-    catch (error) { const message = error instanceof Error ? error.message : '通路测试失败'; setAiConfig((current) => ({ ...current, lastTestStatus: 'failed', lastTestMessage: message, lastTestedAt: new Date().toISOString() })); notify(`通路测试失败：${message}`); return null; }
+    catch (error) { const message = errorMessage(error, '通路测试失败'); setAiConfig((current) => ({ ...current, lastTestStatus: 'failed', lastTestMessage: message, lastTestedAt: new Date().toISOString() })); notify(`通路测试失败：${message}`); return null; }
     finally { setIsTestingAi(false); }
   };
   const persistAi = async () => {
@@ -588,8 +631,9 @@ export default function App() {
   const isComposer = view === 'wechat' || view === 'cards';
 
   return <main className="layoutgo-app" style={{ '--brand-accent': brand.accent } as React.CSSProperties}>
-    <aside className="global-nav"><a className="side-brand" href="#top"><img src="/layoutgo-logo-transparent.png" alt="LayoutGo" /></a><nav>{navItems.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? 'active' : ''} onClick={() => openView(id)}><Icon size={17} /><span>{label}</span></button>)}</nav><div className="nav-bottom"><span><Check size={13} />本地保存</span><button title="品牌 VI" onClick={() => setBrandOpen(true)}><Palette size={16} /></button></div></aside>
+    <aside className="global-nav"><a className="side-brand" href="#top"><img src={layoutGoLogoUrl} alt="LayoutGo" /></a><nav>{navItems.map(({ id, label, icon: Icon }) => <button key={id} className={view === id ? 'active' : ''} onClick={() => openView(id)}><Icon size={17} /><span>{label}</span></button>)}</nav><div className="nav-bottom"><span><Check size={13} />本地保存</span><button title="品牌 VI" onClick={() => setBrandOpen(true)}><Palette size={16} /></button></div></aside>
     <section className="app-content">
+      <div className={`app-atmosphere ${isComposer ? 'composer-atmosphere' : ''}`}><GlitterBackdrop /></div>
       <header className="workspace-topbar"><div><p>{view === 'convert' ? 'AI CONTENT STUDIO' : view === 'aiSettings' ? 'AI SERVICE DIRECTORY' : view === 'drafts' ? 'LOCAL ARCHIVE' : 'CONTENT CANVAS'}</p><h1>{view === 'wechat' ? '公众号排版' : view === 'cards' ? '小红书制卡' : view === 'convert' ? 'AI 内容转换' : view === 'aiSettings' ? 'AI 服务配置' : '本地草稿'}</h1></div><div className="workspace-actions">{isComposer && <><span>{wordCount} 字</span><button className="quiet-button" onClick={exportHtml}><FileCode2 size={15} />导出 HTML</button><button className="solid-button" onClick={view === 'wechat' ? copyHtml : exportCards}>{view === 'wechat' ? <Clipboard size={15} /> : <Download size={15} />}{view === 'wechat' ? '复制公众号正文' : '下载图集'}</button></>}</div></header>
       {isComposer && <section className="composer-grid">
         <aside className="template-rail">
@@ -608,7 +652,7 @@ export default function App() {
       </section>}
       {view === 'convert' && <section className="conversion-view"><div className="conversion-intro"><span><Sparkles size={16} />已连接的服务：{activeAiService?.name ?? '未配置'}</span><h2>把一种内容，变成<br />另一种更适合发布的表达。</h2></div><div className="conversion-grid"><article><header><PanelsTopLeft size={20} /><div><h3>长文变小红书卡片</h3><p>生成 4-6 张知识卡片、Emoji 正文与标签</p></div></header><textarea value={articleSource} onChange={(event) => setArticleSource(event.target.value)} placeholder="粘贴一篇长文；留空则使用当前编辑中的文章。" /><footer><span>固定 JSON 输出 · 标题、步骤、行动收束</span><button className="solid-button" disabled={isGenerating} onClick={generateCards}>{isGenerating ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />}生成卡片</button></footer></article><article><header><FileText size={20} /><div><h3>小红书笔记扩写公众号</h3><p>生成具有节奏与层级的完整文章 HTML</p></div></header><textarea value={noteSource} onChange={(event) => setNoteSource(event.target.value)} placeholder="粘贴小红书笔记；留空则使用小红书正文或当前文章。" /><footer><span>固定 HTML 输出 · 引言、分节、金句、结语</span><button className="outline-button" disabled={isGenerating} onClick={expandArticle}>{isGenerating ? <LoaderCircle className="spin" size={15} /> : <Wand2 size={15} />}扩写文章</button></footer></article></div><div className="prompt-note"><KeyRound size={15} /><span>提示词已由 LayoutGo 固化为发布规范，服务商仅负责生成，不会读取或上传你的草稿之外的数据。</span></div></section>}
       {view === 'aiSettings' && <section className="settings-view"><section className="service-directory"><header><div><span>已保存服务</span><small>{aiServices.length} 个</small></div><button className="outline-button" onClick={() => { setAiConfig(newAiService()); setApiKey(''); setHasKey(false); }}><Plus size={14} />新建服务</button></header>{aiServices.length ? <div className="service-cards">{aiServices.map((service) => <div className={`service-card ${service.id === activeAiServiceId ? 'active' : ''}`} key={service.id}><button onClick={() => void activateAiService(service)}><span className={`status-dot ${service.lastTestStatus}`}>{service.lastTestStatus === 'success' ? <CheckCircle2 size={15} /> : service.lastTestStatus === 'failed' ? <CircleAlert size={15} /> : <CircleDashed size={15} />}</span><span><b>{service.name}</b><small>{service.model}{service.id === activeAiServiceId ? ' · 当前使用' : ''}</small></span></button><button className="delete-icon" title={`删除 ${service.name}`} onClick={() => void removeAiService(service)}><Trash2 size={15} /></button></div>)}</div> : <p className="empty-state">尚未保存 AI 服务。完成右侧测试后，服务会显示在这里。</p>}</section><section className="service-form"><header><div><p>CONNECTION SETUP</p><h2>{aiServices.some((service) => service.id === aiConfig.id) ? '编辑 AI 服务' : '新建 AI 服务'}</h2></div>{aiConfig.lastTestStatus === 'success' && <span className="verified"><CheckCircle2 size={14} />已验证可用</span>}</header><div className="field-grid"><label>服务名称<input value={aiConfig.name} onChange={(event) => setAiConfig({ ...aiConfig, name: event.target.value, lastTestStatus: 'untested' })} placeholder="例如：团队 DeepSeek" /></label><label>服务商<select value={aiConfig.providerId} onChange={(event) => selectProvider(event.target.value)}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></label><label>Base URL<input value={aiConfig.baseUrl} onChange={(event) => setAiConfig({ ...aiConfig, baseUrl: event.target.value.replace(/\/$/, ''), lastTestStatus: 'untested' })} placeholder="https://api.example.com/v1" /></label><label>模型名<input value={aiConfig.model} onChange={(event) => setAiConfig({ ...aiConfig, model: event.target.value, lastTestStatus: 'untested' })} placeholder="模型名称" /></label><label className="full-field">API Key<input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={hasKey ? '已保存在系统钥匙串，输入可替换' : '粘贴你的 API Key'} /></label></div>{aiConfig.lastTestMessage && <p className={`connection-message ${aiConfig.lastTestStatus}`}>{aiConfig.lastTestStatus === 'success' ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}{aiConfig.lastTestMessage}</p>}<p className="key-note">保存前会真实请求模型。API Key 仅保存在当前设备的系统钥匙串，不会写入草稿或配置数据库。</p><footer><button className="outline-button" disabled={isTestingAi || isSavingAi} onClick={() => void testCurrentService()}>{isTestingAi ? <LoaderCircle className="spin" size={15} /> : <PlugZap size={15} />}测试通路</button><button className="solid-button" disabled={isTestingAi || isSavingAi} onClick={() => void persistAi()}>{isSavingAi ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}测试并保存</button></footer></section></section>}
-      {view === 'drafts' && <section className="drafts-view"><header><div><p>LOCAL ARCHIVE</p><h2>本地草稿</h2><span>草稿仅保存在当前设备，可随时继续编辑。</span></div><button className="solid-button" onClick={() => { openView('wechat'); newBlankDraft(); }}><Plus size={15} />新建公众号草稿</button></header><section className="draft-group"><h3>公众号排版</h3><div className="draft-board">{drafts.length ? drafts.map((item) => <article className={item.id === draft.id ? 'current' : ''} key={item.id}><button className="draft-card-open" onClick={() => openDraft(item)}><small>{templateTitle(item.template)} · {new Date(item.updatedAt).toLocaleDateString('zh-CN')}</small><h3>{item.title}</h3><p>{getText(item.content).slice(0, 88) || '空白草稿'}</p><span>打开继续编辑 →</span></button><button className="delete-icon" title={`删除 ${item.title}`} onClick={() => void removeDraft(item)}><Trash2 size={15} /></button></article>) : <p className="empty-state">还没有公众号草稿。</p>}</div></section><section className="draft-group"><h3>小红书制卡</h3><div className="draft-board">{xhsDrafts.length ? xhsDrafts.map((item) => <article className={item.id === xhsDraftId ? 'current' : ''} key={item.id}><button className="draft-card-open" onClick={() => openXhsDraft(item)}><small>{xhsTemplates.find((template) => template.id === item.template)?.title ?? '小红书模板'} · {new Date(item.updatedAt).toLocaleDateString('zh-CN')}</small><h3>{item.title}</h3><p>{item.cards.length ? `${item.cards.length} 张卡片 · ${getText(item.content).slice(0, 62)}` : getText(item.content).slice(0, 88) || '空白制卡草稿'}</p><span>打开继续制卡 →</span></button><button className="delete-icon" title={`删除 ${item.title}`} onClick={() => void removeXhsDraft(item)}><Trash2 size={15} /></button></article>) : <p className="empty-state">还没有小红书制卡草稿。</p>}</div></section></section>}
+      {view === 'drafts' && <section className="drafts-view"><header><div><p>LOCAL ARCHIVE</p><h2>本地草稿</h2><span>草稿仅保存在当前设备，可随时继续编辑。</span></div><button className="solid-button" onClick={() => { openView('wechat'); newBlankDraft(); }}><Plus size={15} />新建公众号草稿</button></header><section className="draft-group"><h3>公众号排版</h3><div className="draft-board">{drafts.length ? drafts.map((item) => <article className={item.id === draft.id ? 'current' : ''} key={item.id}><button className="draft-card-open" onClick={() => openDraft(item)}><small>{templateTitle(item.template)} · {new Date(item.updatedAt).toLocaleDateString('zh-CN')}</small><h3>{item.title}</h3><p>{getText(item.content).slice(0, 88) || '空白草稿'}</p><span>打开继续编辑 →</span></button><button className="delete-icon" title={`删除 ${item.title}`} onClick={(event) => { event.stopPropagation(); void removeDraft(item); }}><Trash2 size={15} /></button></article>) : <p className="empty-state">还没有公众号草稿。</p>}</div></section><section className="draft-group"><h3>小红书制卡</h3><div className="draft-board">{xhsDrafts.length ? xhsDrafts.map((item) => <article className={item.id === xhsDraftId ? 'current' : ''} key={item.id}><button className="draft-card-open" onClick={() => openXhsDraft(item)}><small>{xhsTemplates.find((template) => template.id === item.template)?.title ?? '小红书模板'} · {new Date(item.updatedAt).toLocaleDateString('zh-CN')}</small><h3>{item.title}</h3><p>{item.cards.length ? `${item.cards.length} 张卡片 · ${getText(item.content).slice(0, 62)}` : getText(item.content).slice(0, 88) || '空白制卡草稿'}</p><span>打开继续制卡 →</span></button><button className="delete-icon" title={`删除 ${item.title}`} onClick={(event) => { event.stopPropagation(); void removeXhsDraft(item); }}><Trash2 size={15} /></button></article>) : <p className="empty-state">还没有小红书制卡草稿。</p>}</div></section></section>}
     </section>
     {referenceOpen && <aside className="reference-dialog" role="dialog" aria-modal="true" aria-label="公众号文章风格参考">
       <header><div><p>ARTICLE STYLE REFERENCE</p><h2>参考公众号文章风格</h2></div><button title="关闭" onClick={() => setReferenceOpen(false)}><X size={18} /></button></header>
